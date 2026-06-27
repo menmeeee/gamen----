@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIX カラオケ [PC演奏・自動待機演出システム]</title>
+    <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body { background-color: #121214; color: #fff; font-family: sans-serif; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; gap: 15px; }
+        .setup-box { background: #1e1e24; padding: 15px; border-radius: 8px; width: 100%; max-width: 960px; border: 1px solid #333; text-align: center; }
+        .connection-id { font-size: 24px; color: #00ccff; font-weight: bold; background: #000; padding: 8px 20px; border-radius: 4px; display: inline-block; margin: 5px 0; }
+        
+        #monitor-container { position: relative; width: 100%; max-width: 960px; aspect-ratio: 16/9; background: #000; border-radius: 8px; overflow: hidden; border: 3px solid #444; }
+        
+        /* YouTubeおよび待機動画：pointer-events: autoで直接タッチ操作可能 */
+        #video-frame { width: 100%; height: 100%; border: none; position: absolute; top: 0; left: 0; z-index: 1; pointer-events: auto; }
+        
+        /* 待機中のカラオケ風ランキングボードレイヤー */
+        #idle-ranking-screen { position: absolute; top:0; left:0; width:100%; height:100%; background: linear-gradient(135deg, #1f1c2c, #928dab); z-index: 3; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 20px; box-sizing: border-box; }
+        .rank-title { font-size: 26px; font-weight: bold; color: #ffeb3b; margin-bottom: 15px; text-shadow: 2px 2px 4px rgba(0,0,0,0.6); }
+        .rank-table { width: 80%; background: rgba(0,0,0,0.6); border-radius: 10px; padding: 15px; border: 1px solid #fff; }
+        .rank-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #444; font-size: 16px; }
+
+        #info-overlay { position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,0.85); padding: 8px 15px; border-radius: 6px; z-index: 10; border: 1px solid #333; pointer-events: none; }
+        #lyrics-layer { position: absolute; bottom: 35px; left: 0; width: 100%; text-align: center; z-index: 5; pointer-events: none; display: none; }
+        #lyrics-text { background: rgba(0,0,0,0.8); color: #ffff00; font-size: 26px; font-weight: bold; padding: 8px 25px; border-radius: 6px; display: inline-block; border: 2px solid #fff; }
+        
+        .fullscreen-btn { position: absolute; bottom: 15px; right: 15px; z-index: 10; background: #e60012; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-weight: bold; }
+        .status-bar { width: 100%; max-width: 960px; display: flex; justify-content: space-between; background: #1e1e24; padding: 10px; border-radius: 6px; font-size: 14px; border: 1px solid #333; }
+    </style>
+</head>
+<body>
+
+    <div class="setup-box">
+        <h2><i class="fa-solid fa-desktop"></i> PC演奏モニター画面</h2>
+        <div class="connection-id" id="my-id">ID取得中...</div>
+        <div id="conn-status" style="color: #ff3344; margin-top: 5px;"><i class="fa-solid fa-triangle-exclamation"></i> ナビ接続待機中...</div>
+    </div>
+
+    <div id="monitor-container">
+        <div id="info-overlay">
+            <h4 id="m-state" style="margin:0; color:#00ff88; font-size:12px;">IDLE MODE</h4>
+            <h3 id="m-title" style="margin:5px 0 0 0; color:#fff; font-size:16px;">AIX 週間ヒットチャート</h3>
+        </div>
+
+        <div id="idle-ranking-screen">
+            <div class="rank-title"><i class="fa-solid fa-trophy"></i> AIX カラオケ週間総合ランキング</div>
+            <div class="rank-table">
+                <div class="rank-row" style="color:#00ff88; font-weight:bold;"><span>順位 / 楽曲</span><span>アーティスト</span></div>
+                <div class="rank-row"><span>第1位  アイドル</span><span>YOASOBI</span></div>
+                <div class="rank-row"><span>第2位  残酷な天使のテーゼ</span><span>高橋洋子</span></div>
+                <div class="rank-row"><span>第3位  新時代</span><span>Ado</span></div>
+                <div class="rank-row"><span>第4位  怪獣の花唄</span><span>Vaundy</span></div>
+            </div>
+            <div style="font-size:12px; color:#eee; margin-top:15px; font-style:italic;">♪ リモコン（ナビ）から曲を選ぶと演奏が始まります...</div>
+        </div>
+        
+        <iframe id="video-frame" src="about:blank" allow="autoplay; encrypted-media" style="display:none;"></iframe>
+
+        <div id="lyrics-layer"><div id="lyrics-text"></div></div>
+        
+        <button class="fullscreen-btn" onclick="toggleFullscreen()"><i class="fa-solid fa-expand"></i> 画面を全画面表示</button>
+    </div>
+
+    <div class="status-bar">
+        <div>現在の音量設定: <span id="vol-display" style="color:#00ff88; font-weight:bold;">MAX (標準)</span></div>
+        <div id="queue-count">予約曲数: 0曲</div>
+    </div>
+
+    <script>
+        let peer = new Peer(); 
+        let conn = null;
+        let queue = [];
+        let currentTrack = null;
+        let lyricsInterval = null;
+        let currentVolume = 100; // 内部ボリューム
+        
+        // 待機中に流すランダムな環境映像のYouTube IDリスト（リラックス系・BGV）
+        const randomIdleVideos = ["5G2X_mB_m_Y", "26mP7Wp9A9A", "77ZtREm8rYI"];
+
+        peer.on('open', (id) => { document.getElementById('my-id').innerText = id; });
+
+        peer.on('connection', (connection) => {
+            conn = connection;
+            document.getElementById('conn-status').innerHTML = '<i class="fa-solid fa-circle-check" style="color:#00ff88;"></i> リモコンナビと連動中';
+            document.getElementById('conn-status').style.color = "#00ff88";
+
+            conn.on('data', (data) => {
+                if (data.type === 'sync-database') {
+                    // 同期
+                } else if (data.type === 'reserve') {
+                    queue.push(data.song);
+                    document.getElementById("queue-count").innerText = `予約曲数: ${queue.length}曲`;
+                    if (!currentTrack) playNext();
+                } else if (data.type === 'control') {
+                    handleRemoteControl(data.action);
+                }
+            });
+        });
+
+        // ナビ側からの音量設定・演奏停止指示をリアルタイム処理
+        function handleRemoteControl(action) {
+            const iframe = document.getElementById("video-frame");
+            const volDisp = document.getElementById("vol-display");
+
+            if (action === 'stop') {
+                playNext(); // 次の曲、または待機に戻す
+            } else if (action === 'retry') {
+                if (currentTrack) { queue.unshift(currentTrack); playNext(); }
+            } else if (action === 'vol-up') {
+                currentVolume = Math.min(100, currentVolume + 20);
+                volDisp.innerText = currentVolume + "%";
+                alert("音量を上げました。PC本体か動画内シークで微調整して下さい。");
+            } else if (action === 'vol-down') {
+                currentVolume = Math.max(0, currentVolume - 20);
+                volDisp.innerText = currentVolume + "%";
+                alert("音量を下げました。");
+            } else if (action === 'vol-mute') {
+                currentVolume = 0;
+                volDisp.innerText = "ミュート (0%)";
+            }
+        }
+
+        // 演奏終了・待機ルーチン
+        function playNext() {
+            clearInterval(lyricsInterval);
+            const iframe = document.getElementById("video-frame");
+            const rankingOverlay = document.getElementById("idle-ranking-screen");
+            const lyricsLayer = document.getElementById("lyrics-layer");
+
+            if (queue.length === 0) {
+                currentTrack = null;
+                document.getElementById("queue-count").innerText = `予約曲数: 0曲`;
+                document.getElementById("m-state").innerText = "IDLE MODE";
+                document.getElementById("m-title").innerText = "AIX 待機中 / BGV再生";
+
+                // 【待機中仕様】ランキングボードを消し、代わりにランダムな環境動画をサイレントで自動リピート再生
+                rankingOverlay.style.display = "none"; 
+                iframe.style.display = "block";
+                const randomId = randomIdleVideos[Math.floor(Math.random() * randomIdleVideos.length)];
+                iframe.src = `https://www.youtube.com/embed/${randomId}?autoplay=1&controls=0&mute=1&loop=1&playlist=${randomId}`;
+                lyricsLayer.style.display = "none";
+                return;
+            }
+
+            // 曲が予約されていた場合
+            currentTrack = queue.shift();
+            document.getElementById("queue-count").innerText = `予約曲数: ${queue.length}曲`;
+
+            document.getElementById("m-state").innerText = "NOW PLAYING";
+            document.getElementById("m-title").innerText = currentTrack.title + " / " + currentTrack.artist;
+
+            rankingOverlay.style.display = "none";
+            iframe.style.display = "block";
+
+            if (!currentTrack.isCustomVideo) {
+                lyricsLayer.style.display = "none";
+                iframe.src = `https://www.youtube.com/embed/${currentTrack.ytid}?autoplay=1&controls=1&rel=0`;
+            } else {
+                // カスタム自作曲
+                const bgVideo = currentTrack.bgUrl || "5G2X_mB_m_Y";
+                iframe.src = `https://www.youtube.com/embed/${bgVideo}?autoplay=1&controls=1&mute=0&playlist=${bgVideo}`;
+
+                if (currentTrack.lyrics && currentTrack.lyrics.length > 0) {
+                    lyricsLayer.style.display = "block";
+                    let idx = 0;
+                    document.getElementById("lyrics-text").innerText = currentTrack.lyrics[0];
+                    lyricsInterval = setInterval(() => {
+                        idx++;
+                        if (idx < currentTrack.lyrics.length) {
+                            document.getElementById("lyrics-text").innerText = currentTrack.lyrics[idx];
+                        } else {
+                            document.getElementById("lyrics-text").innerText = "♪";
+                            clearInterval(lyricsInterval);
+                        }
+                    }, 10000);
+                }
+            }
+        }
+
+        function toggleFullscreen() {
+            const elem = document.getElementById("monitor-container");
+            if (!document.fullscreenElement) {
+                if (elem.requestFullscreen) elem.requestFullscreen();
+            } else {
+                if (document.exitFullscreen) document.exitFullscreen();
+            }
+        }
+    </script>
+</body>
+</html>
